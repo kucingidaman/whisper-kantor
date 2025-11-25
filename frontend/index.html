@@ -1,0 +1,410 @@
+print("""
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper Speech to Text</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-indigo-50 via-white to-purple-50 min-h-screen">
+    <div id="root"></div>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+
+        function App() {
+            const [isRecording, setIsRecording] = useState(false);
+            const [transcriptions, setTranscriptions] = useState([]);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [error, setError] = useState('');
+            const [recordingTime, setRecordingTime] = useState(0);
+            const [serverStatus, setServerStatus] = useState('checking');
+            const [showModelSelector, setShowModelSelector] = useState(false);
+            const [models, setModels] = useState({});
+            const [currentModel, setCurrentModel] = useState('base');
+            const [recommendedModel, setRecommendedModel] = useState(null);
+            const [isChangingModel, setIsChangingModel] = useState(false);
+            const [hasGPU, setHasGPU] = useState(false);
+            
+            const mediaRecorderRef = useRef(null);
+            const chunksRef = useRef([]);
+            const timerRef = useRef(null);
+
+            useEffect(() => {
+                checkServerHealth();
+                loadModelsInfo();
+                return () => {
+                    if (timerRef.current) clearInterval(timerRef.current);
+                };
+            }, []);
+
+            const checkServerHealth = async () => {
+                try {
+                    const response = await fetch('/api/health');
+                    if (response.ok) {
+                        const data = await response.json();
+                        setServerStatus('online');
+                        setCurrentModel(data.model);
+                        setHasGPU(data.gpu_available);
+                    } else {
+                        setServerStatus('offline');
+                    }
+                } catch (err) {
+                    setServerStatus('offline');
+                }
+            };
+
+            const loadModelsInfo = async () => {
+                try {
+                    const response = await fetch('/api/models');
+                    if (response.ok) {
+                        const data = await response.json();
+                        setModels(data.models);
+                        setCurrentModel(data.current);
+                        setRecommendedModel(data.recommended);
+                        setHasGPU(data.has_gpu);
+                        
+                        // Show downloaded models info
+                        if (data.downloaded && data.downloaded.length > 0) {
+                            console.log('Models sudah diunduh:', data.downloaded.join(', '));
+                        }
+                        console.log('Model directory:', data.model_dir);
+                    }
+                } catch (err) {
+                    console.error('Failed to load models info:', err);
+                }
+            };
+
+            const changeModel = async (modelName) => {
+                setIsChangingModel(true);
+                setError('');
+                
+                try {
+                    const response = await fetch('/api/change-model', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: modelName })
+                    });
+
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        setCurrentModel(modelName);
+                        setShowModelSelector(false);
+                        alert('Model berhasil diubah ke ' + modelName);
+                    } else {
+                        throw new Error(data.error);
+                    }
+                } catch (err) {
+                    setError('Gagal mengubah model: ' + err.message);
+                } finally {
+                    setIsChangingModel(false);
+                }
+            };
+
+            const startRecording = async () => {
+                try {
+                    setError('');
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    
+                    mediaRecorderRef.current = new MediaRecorder(stream);
+                    chunksRef.current = [];
+
+                    mediaRecorderRef.current.ondataavailable = (e) => {
+                        if (e.data.size > 0) chunksRef.current.push(e.data);
+                    };
+
+                    mediaRecorderRef.current.onstop = async () => {
+                        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+                        await processAudio(audioBlob);
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+
+                    mediaRecorderRef.current.start();
+                    setIsRecording(true);
+                    setRecordingTime(0);
+                    
+                    timerRef.current = setInterval(() => {
+                        setRecordingTime(prev => prev + 1);
+                    }, 1000);
+                    
+                } catch (err) {
+                    setError('Gagal mengakses mikrofon');
+                }
+            };
+
+            const stopRecording = () => {
+                if (mediaRecorderRef.current && isRecording) {
+                    mediaRecorderRef.current.stop();
+                    setIsRecording(false);
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current);
+                        timerRef.current = null;
+                    }
+                }
+            };
+
+            const processAudio = async (audioBlob) => {
+                setIsProcessing(true);
+                setError('');
+
+                try {
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'recording.webm');
+
+                    const response = await fetch('/api/transcribe', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) throw new Error('Gagal memproses audio');
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        const newTranscription = {
+                            id: Date.now(),
+                            text: data.transcription,
+                            timestamp: new Date().toLocaleString('id-ID'),
+                            duration: recordingTime,
+                            modelUsed: data.model_used,
+                            audioUrl: URL.createObjectURL(audioBlob)
+                        };
+                        setTranscriptions(prev => [newTranscription, ...prev]);
+                    }
+                } catch (err) {
+                    setError('Gagal memproses audio: ' + err.message);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const handleFileUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                if (!file.type.startsWith('audio/')) {
+                    setError('Harap pilih file audio yang valid');
+                    return;
+                }
+                setRecordingTime(0);
+                await processAudio(file);
+            };
+
+            const downloadTranscription = (text, id) => {
+                const element = document.createElement('a');
+                const file = new Blob([text], { type: 'text/plain' });
+                element.href = URL.createObjectURL(file);
+                element.download = `transkripsi_${id}.txt`;
+                document.body.appendChild(element);
+                element.click();
+                document.body.removeChild(element);
+            };
+
+            const deleteTranscription = (id) => {
+                if (confirm('Hapus transkripsi ini?')) {
+                    setTranscriptions(prev => prev.filter(t => t.id !== id));
+                }
+            };
+
+            const formatTime = (seconds) => {
+                const mins = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                return `${mins}:${secs.toString().padStart(2, '0')}`;
+            };
+
+            const getModelBadgeColor = (modelName) => {
+                const colors = {
+                    'tiny': 'bg-gray-100 text-gray-800',
+                    'base': 'bg-blue-100 text-blue-800',
+                    'small': 'bg-green-100 text-green-800',
+                    'medium': 'bg-yellow-100 text-yellow-800',
+                    'large': 'bg-purple-100 text-purple-800',
+                    'large-v2': 'bg-red-100 text-red-800'
+                };
+                return colors[modelName] || 'bg-gray-100 text-gray-800';
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-8">
+                    <div className="max-w-4xl mx-auto">
+                        <div className="text-center mb-6">
+                            <h1 className="text-4xl font-bold text-gray-800 mb-2">Speech to Text</h1>
+                            <p className="text-gray-600 mb-3">Powered by OpenAI Whisper - 100% Offline</p>
+                            <div className="flex items-center justify-center space-x-2">
+                                <span className={`px-3 py-1 rounded-full text-xs font-medium ${
+                                    serverStatus === 'online' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                                }`}>
+                                    {serverStatus === 'online' ? '● Online' : '● Offline'}
+                                </span>
+                                <span className={`px-3 py-1 rounded-full text-xs font-medium ${getModelBadgeColor(currentModel)}`}>
+                                    Model: {currentModel}
+                                </span>
+                                {hasGPU && <span className="px-3 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800">⚡ GPU</span>}
+                            </div>
+                        </div>
+
+                        <div className="text-center mb-4">
+                            <button onClick={() => setShowModelSelector(!showModelSelector)} 
+                                className="px-6 py-2 bg-indigo-600 text-white rounded-full hover:bg-indigo-700 font-medium">
+                                ⚙️ Pilih Model
+                            </button>
+                        </div>
+
+                        {showModelSelector && (
+                            <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
+                                <div className="flex justify-between mb-4">
+                                    <h2 className="text-xl font-bold">Pilih Model Whisper</h2>
+                                    <button onClick={() => setShowModelSelector(false)} className="text-gray-500">✕</button>
+                                </div>
+
+                                {recommendedModel && (
+                                    <div className="bg-blue-50 border-l-4 border-blue-500 p-3 mb-4 rounded">
+                                        <p className="text-sm text-blue-700">
+                                            <strong>Rekomendasi:</strong> {recommendedModel.model} - {recommendedModel.reason}
+                                        </p>
+                                    </div>
+                                )}
+
+                                <div className="grid grid-cols-2 gap-3">
+                                    {Object.keys(models).map((modelName) => {
+                                        const model = models[modelName];
+                                        const isRecommended = recommendedModel && recommendedModel.model === modelName;
+                                        const isCurrent = currentModel === modelName;
+                                        
+                                        return (
+                                            <div key={modelName}
+                                                className={`p-4 rounded-xl border-2 cursor-pointer ${
+                                                    isCurrent ? 'border-indigo-500 bg-indigo-50' : 
+                                                    isRecommended ? 'border-blue-300 bg-blue-50' : 'border-gray-200'
+                                                }`}
+                                                onClick={() => !isCurrent && !isChangingModel && changeModel(modelName)}>
+                                                <div className="flex justify-between mb-2">
+                                                    <h3 className="font-bold">{modelName}</h3>
+                                                    {isCurrent && <span className="px-2 py-1 bg-indigo-600 text-white text-xs rounded-full">Aktif</span>}
+                                                    {isRecommended && !isCurrent && <span className="px-2 py-1 bg-blue-600 text-white text-xs rounded-full">✓</span>}
+                                                </div>
+                                                <div className="space-y-1 text-xs text-gray-600">
+                                                    <div>📦 {model.size}</div>
+                                                    <div>⚡ {model.speed}</div>
+                                                    <div>⭐ {model.quality}</div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+
+                                {isChangingModel && (
+                                    <div className="mt-4 text-center text-indigo-600">
+                                        <p>Mengubah model...</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        <div className="bg-white rounded-3xl shadow-xl p-8 mb-6">
+                            <div className="flex flex-col items-center">
+                                <button
+                                    onClick={isRecording ? stopRecording : startRecording}
+                                    disabled={isProcessing || serverStatus !== 'online'}
+                                    className={`p-8 rounded-full mb-4 ${
+                                        isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-indigo-600 hover:bg-indigo-700'
+                                    } ${isProcessing || serverStatus !== 'online' ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                                    <svg className="w-12 h-12 text-white" fill={isRecording ? 'currentColor' : 'none'} 
+                                        stroke={isRecording ? 'none' : 'currentColor'} viewBox="0 0 24 24">
+                                        {isRecording ? (
+                                            <rect x="6" y="6" width="12" height="12" />
+                                        ) : (
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} 
+                                                d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                                        )}
+                                    </svg>
+                                </button>
+
+                                {isRecording && (
+                                    <div className="text-center mb-4">
+                                        <div className="text-3xl font-bold">{formatTime(recordingTime)}</div>
+                                        <div className="text-sm text-gray-500">Merekam...</div>
+                                    </div>
+                                )}
+
+                                {isProcessing && (
+                                    <div className="w-full max-w-md mb-4">
+                                        <div className="text-center text-indigo-600 mb-2">
+                                            <p className="font-medium">Memproses dengan Whisper...</p>
+                                        </div>
+                                        <div className="w-full bg-gray-200 rounded-full h-2">
+                                            <div className="bg-indigo-600 h-2 rounded-full animate-pulse" style={{width: '100%'}}></div>
+                                        </div>
+                                        <div className="text-center mt-2 text-sm text-gray-500">
+                                            Model: {currentModel} | {hasGPU ? 'GPU' : 'CPU'}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <label className="px-6 py-3 bg-gray-100 hover:bg-gray-200 rounded-full cursor-pointer">
+                                    📁 Upload Audio
+                                    <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" 
+                                        disabled={isProcessing || isRecording || serverStatus !== 'online'} />
+                                </label>
+
+                                {error && (
+                                    <div className="mt-4 p-4 bg-red-50 border-l-4 border-red-500 rounded w-full">
+                                        <p className="text-red-700">{error}</p>
+                                    </div>
+                                )}
+
+                                {transcriptions.length === 0 && !isRecording && !isProcessing && (
+                                    <div className="text-center py-8 text-gray-500">
+                                        <p>Klik tombol mikrofon untuk merekam</p>
+                                        <p className="text-sm">atau upload file audio</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        {transcriptions.length > 0 && (
+                            <div className="space-y-4">
+                                <h2 className="text-2xl font-bold">Hasil Transkripsi</h2>
+                                {transcriptions.map((trans) => (
+                                    <div key={trans.id} className="bg-white rounded-2xl shadow-lg p-6">
+                                        <div className="flex justify-between mb-4">
+                                            <div>
+                                                <div className="text-sm text-gray-500">{trans.timestamp}</div>
+                                                <div className="text-xs text-gray-400">
+                                                    {formatTime(trans.duration)} | {trans.modelUsed}
+                                                </div>
+                                            </div>
+                                            <div className="flex space-x-2">
+                                                <button onClick={() => downloadTranscription(trans.text, trans.id)}
+                                                    className="p-2 text-indigo-600 hover:bg-indigo-50 rounded-lg">
+                                                    ⬇️
+                                                </button>
+                                                <button onClick={() => deleteTranscription(trans.id)}
+                                                    className="p-2 text-red-600 hover:bg-red-50 rounded-lg">
+                                                    🗑️
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div className="bg-gray-50 rounded-xl p-4 mb-4">
+                                            <p className="text-gray-800 whitespace-pre-wrap">{trans.text}</p>
+                                        </div>
+                                        {trans.audioUrl && <audio controls src={trans.audioUrl} className="w-full" />}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
+""")
